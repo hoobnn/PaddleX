@@ -477,7 +477,9 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                         end = start + t * h * w
                         image_embeddings = embeddings[start:end, :]
                         position_embedding = (
-                            self.interpolate_pos_encoding(image_embeddings, h, w, True)
+                            self.fetch_position_embedding_lfu_cache(
+                                image_embeddings, h, w
+                            )
                             .squeeze(0)
                             .repeat(t, 1)
                         )
@@ -608,6 +610,7 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             hidden_states: torch.Tensor,
             cu_seqlens: Optional[List[torch.Tensor]] = None,
             rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            max_seqlen: Optional[int] = None,
         ) -> torch.Tensor:
             batch_size, seq_length, embed_dim = hidden_states.shape
 
@@ -626,7 +629,8 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 from flash_attn import flash_attn_varlen_func
 
                 q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                if max_seqlen is None:
+                    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                 output = flash_attn_varlen_func(
                     q,
                     k,
@@ -770,6 +774,7 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             hidden_states: torch.Tensor,
             cu_seqlens: Optional[List[torch.Tensor]] = None,
             rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            max_seqlen: Optional[int] = None,
         ) -> Tuple[torch.FloatTensor]:
 
             residual = hidden_states
@@ -779,6 +784,7 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 hidden_states=hidden_states,
                 cu_seqlens=cu_seqlens,
                 rope_emb=rope_emb,
+                max_seqlen=max_seqlen,
             )
 
             hidden_states = residual + hidden_states
@@ -840,6 +846,8 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             ] = None,
             height_position_ids: Optional[torch.Tensor] = None,
             width_position_ids: Optional[torch.Tensor] = None,
+            max_seqlen: Optional[int] = None,
+            max_grid_size: Optional[int] = None,
         ) -> BaseModelOutput:
             device = inputs_embeds.device
             hidden_states = inputs_embeds
@@ -862,7 +870,8 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 [height_position_ids, width_position_ids],
                 dim=-1,
             )
-            max_grid_size = pids.max() + 1
+            if max_grid_size is None:
+                max_grid_size = pids.max() + 1
             rope_emb_max_grid = self.rotary_pos_emb(max_grid_size)
             rope_emb = rope_emb_max_grid[pids].flatten(1)
             rope_emb = rope_emb.repeat(1, 2)
@@ -871,11 +880,22 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             attn_cu_seqlens = cu_seqlens
             hidden_states = inputs_embeds
 
+            _cached_max_seqlen = max_seqlen
+            if (
+                _cached_max_seqlen is None
+                and attn_cu_seqlens is not None
+                and len(attn_cu_seqlens) > 1
+            ):
+                _cached_max_seqlen = (
+                    attn_cu_seqlens[1:] - attn_cu_seqlens[:-1]
+                ).max().item()
+
             for encoder_layer in self.layers:
                 hidden_states = encoder_layer(
                     hidden_states,
                     cu_seqlens=attn_cu_seqlens,
                     rope_emb=rope_emb,
+                    max_seqlen=_cached_max_seqlen,
                 )
             return hidden_states
 
@@ -906,6 +926,8 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             position_ids: Optional[torch.Tensor] = None,
             height_position_ids: Optional[torch.Tensor] = None,
             width_position_ids: Optional[torch.Tensor] = None,
+            max_seqlen: Optional[int] = None,
+            max_grid_size: Optional[int] = None,
             cu_seqlens: Optional[List[torch.Tensor]] = None,
             image_grid_thw: Optional[
                 List[
@@ -930,21 +952,35 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 image_grid_thw=image_grid_thw,
                 height_position_ids=height_position_ids,
                 width_position_ids=width_position_ids,
+                max_seqlen=max_seqlen,
+                max_grid_size=max_grid_size,
             )
 
             last_hidden_state = self.post_layernorm(last_hidden_state)
 
             sample_hidden_state = list()
-            if cu_seqlens is None:
-                raise ValueError(
-                    "cu_seqlens cannot be None for "
-                    "SiglipVisionTransformer output processing."
-                )
-            for i in range(cu_seqlens.shape[0] - 1):
-                start = cu_seqlens[i]
-                end = cu_seqlens[i + 1]
+            if image_grid_thw is not None:
+                sample_lengths = [
+                    t * h * w for t, h, w in SiglipEncoder.flatten_list(image_grid_thw)
+                ]
+            else:
+                if cu_seqlens is None:
+                    raise ValueError(
+                        "cu_seqlens cannot be None for "
+                        "SiglipVisionTransformer output processing."
+                    )
+                cu_seqlens_list = cu_seqlens.tolist()
+                sample_lengths = [
+                    cu_seqlens_list[i + 1] - cu_seqlens_list[i]
+                    for i in range(len(cu_seqlens_list) - 1)
+                ]
+
+            start = 0
+            for length in sample_lengths:
+                end = start + length
                 tensor = last_hidden_state[:, start:end, :].squeeze(0)
                 sample_hidden_state.append(tensor)
+                start = end
 
             return sample_hidden_state
 
@@ -983,6 +1019,10 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
             pixel_values,
             interpolate_pos_encoding: bool = False,
             position_ids: Optional[torch.Tensor] = None,
+            height_position_ids: Optional[torch.Tensor] = None,
+            width_position_ids: Optional[torch.Tensor] = None,
+            max_seqlen: Optional[int] = None,
+            max_grid_size: Optional[int] = None,
             image_grid_thw: Optional[
                 List[
                     Union[
@@ -998,6 +1038,10 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 pixel_values=pixel_values,
                 interpolate_pos_encoding=interpolate_pos_encoding,
                 position_ids=position_ids,
+                height_position_ids=height_position_ids,
+                width_position_ids=width_position_ids,
+                max_seqlen=max_seqlen,
+                max_grid_size=max_grid_size,
                 image_grid_thw=image_grid_thw,
                 cu_seqlens=cu_seqlens,
             )
@@ -1138,29 +1182,43 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
 
         def encode_image(self, pixel_values, image_grid_thw):
             pixel_values = pixel_values.type(self.visual.dtype)
+            device = pixel_values.device
             siglip_position_ids = list()
+            height_position_ids = list()
+            width_position_ids = list()
             image_grid_hws = list()
-            cu_seqlens = [0]
+            cu_seqlens_values = [0]
+            max_seqlen = 0
+            max_grid_size = 0
 
             for idx, thw in enumerate(image_grid_thw):
-                thw_tuple = tuple(thw.detach().cpu().numpy().tolist())
-                numel = np.prod(thw_tuple)
-                image_grid_hws.append(thw_tuple)
-                image_position_ids = torch.arange(numel) % np.prod(thw_tuple[1:])
+                t_val, h_val, w_val = thw[0].item(), thw[1].item(), thw[2].item()
+                numel = t_val * h_val * w_val
+                hw_prod = h_val * w_val
+                image_grid_hws.append((t_val, h_val, w_val))
+                image_position_ids = torch.arange(numel, device=device) % hw_prod
                 siglip_position_ids.append(image_position_ids)
-                cu_seqlens.append(cu_seqlens[-1] + numel)
+                height_position_ids.append(image_position_ids // w_val)
+                width_position_ids.append(image_position_ids % w_val)
+                cu_seqlens_values.append(cu_seqlens_values[-1] + numel)
+                max_seqlen = max(max_seqlen, numel)
+                max_grid_size = max(max_grid_size, h_val, w_val)
 
-            siglip_position_ids = torch.concat(siglip_position_ids, dim=0).to(
-                pixel_values.device
-            )
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(
-                pixel_values.device
+            siglip_position_ids = torch.concat(siglip_position_ids, dim=0)
+            height_position_ids = torch.concat(height_position_ids, dim=0)
+            width_position_ids = torch.concat(width_position_ids, dim=0)
+            cu_seqlens = torch.tensor(
+                cu_seqlens_values, dtype=torch.int32, device=device
             )
 
             vision_outputs = self.visual(
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_hws,
                 position_ids=siglip_position_ids,
+                height_position_ids=height_position_ids,
+                width_position_ids=width_position_ids,
+                max_seqlen=max_seqlen,
+                max_grid_size=max_grid_size,
                 interpolate_pos_encoding=True,
                 cu_seqlens=cu_seqlens,
             )
