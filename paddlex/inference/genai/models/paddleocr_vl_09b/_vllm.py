@@ -533,8 +533,12 @@ if all(map(is_dep_available, ("einops", "torch", "transformers", "vllm"))):
                 ) = pixel_values.shape
                 target_dtype = self.patch_embedding.weight.dtype
                 pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
-                patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
-                embeddings = patch_embeds.flatten(-2).squeeze(-1)
+                pv = pixel_values.to(dtype=target_dtype)
+                patches = pv.reshape(pv.shape[0], -1)
+                weight = self.patch_embedding.weight.reshape(self.embed_dim, -1)
+                embeddings = patches @ weight.t()
+                if self.patch_embedding.bias is not None:
+                    embeddings = embeddings + self.patch_embedding.bias
 
                 if interpolate_pos_encoding and image_grid_thw is not None:
                     start = 0
